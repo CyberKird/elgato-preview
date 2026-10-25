@@ -1,7 +1,7 @@
 # Elgato Preview
 
 Low-latency live preview for the Elgato Game Capture HD60 S on Windows. A small D3D11 window that shows the capture card's video and nothing else, made to sit under tools like Lossless Scaling.
-r
+
 <a href="https://ko-fi.com/joltarise"><img src="https://raw.githubusercontent.com/CyberKird/.github/main/assets/ko-fi-button.svg" alt="Support me on Ko-fi" width="200"></a>
 
 Unofficial. Not affiliated with or endorsed by Elgato or Corsair.
