@@ -4,7 +4,8 @@ using System.Text;
 using Vortice.MediaFoundation;
 
 // Elgato HD60 S low-latency preview. Right click = menu, F2 = settings. Keys: F fullscreen, L 1080p window for
-// Lossless Scaling, V vsync, S sharp/smooth, I stats, T always on top, Esc quit.
+// Lossless Scaling, V vsync, S sharp/smooth, I stats, T always on top, G frame generation (RIFE), H steady HUD, Esc quit.
+// Self-test of frame generation: --fgtest <dir> <name> [nohud] (see FgTest.cs).
 // Args: --device <name part>, --monitor <n>, --ls (start in 1080p window), --stats
 static class Program
 {
@@ -18,6 +19,7 @@ static class Program
         Application.EnableVisualStyles();
         Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.High;
         timeBeginPeriod(1);
+        if (args.Length >= 3 && args[0] == "--fgtest") { FgTest.Run(args[1], args[2], args.Length < 4 || args[3] != "nohud"); return; }
         Application.Run(new PreviewForm(args));
     }
 
@@ -47,6 +49,9 @@ sealed class PreviewForm : Form
     volatile string statsText = "";
     volatile string[] devices = [];
     volatile Fmt[] formats = [];
+    FrameGen? fg; // created on the capture thread the first time frame generation is on
+    bool fgFailed;
+    string fgNote = "";
 
     public PreviewForm(string[] args)
     {
@@ -174,6 +179,8 @@ sealed class PreviewForm : Form
             Item("Scaling: " + ScalerNames[cfg.Scaler], false, CycleScaler, "S"),
             Item("Play capture audio", cfg.Audio, () => { cfg.Audio = !cfg.Audio; Apply(false, false); }),
             Item("Skip repeated frames", cfg.SkipDupes, () => { cfg.SkipDupes = !cfg.SkipDupes; Apply(false, false); }, "D"),
+            Item("Frame generation 30 -> 60 (RIFE)", cfg.FrameGen, () => { cfg.FrameGen = !cfg.FrameGen; Apply(false, false); }, "G"),
+            Item("Steady HUD (frame generation)", cfg.SteadyHud, () => { cfg.SteadyHud = !cfg.SteadyHud; Apply(false, false); }, "H"),
             Item("Exclusive fullscreen (AMD AFMF)", cfg.Exclusive, () => { cfg.Exclusive = !cfg.Exclusive; Apply(false, false); }, "E"),
             Item("Show stats", cfg.Stats, () => { cfg.Stats = !cfg.Stats; Apply(false, false); }, "I"),
             Item("Always on top", cfg.TopMost, () => { cfg.TopMost = !cfg.TopMost; Apply(false, false); }, "T"),
@@ -212,6 +219,8 @@ sealed class PreviewForm : Form
             case Keys.V: cfg.Vsync = !cfg.Vsync; Apply(false, false); return true;
             case Keys.S: CycleScaler(); return true;
             case Keys.D: cfg.SkipDupes = !cfg.SkipDupes; Apply(false, false); return true;
+            case Keys.G: cfg.FrameGen = !cfg.FrameGen; Apply(false, false); return true;
+            case Keys.H: cfg.SteadyHud = !cfg.SteadyHud; Apply(false, false); return true;
             case Keys.E: cfg.Exclusive = !cfg.Exclusive; Apply(false, false); return true;
             case Keys.I: cfg.Stats = !cfg.Stats; Apply(false, false); return true;
             case Keys.T: cfg.TopMost = !cfg.TopMost; Apply(false, false); return true;
@@ -321,21 +330,88 @@ sealed class PreviewForm : Form
             // bytes, measured on the HD60 S, real changes reach 200): present only new frames so the window follows the game
             // framerate and Lossless Scaling sees the real source rate. Sampled compare against the last shown frame.
             const int Stride = 5, Tolerance = 6;
-            void Show(IntPtr p, int pitch)
+            bool IsNew(ReadOnlySpan<byte> cur)
+            {
+                if (prev != null && prev.Length == cur.Length)
+                {
+                    bool same = true;
+                    for (int i = 0; i < cur.Length && same; i += Stride) same = Math.Abs(cur[i] - prev[i]) <= Tolerance;
+                    if (same) return false;
+                }
+                else prev = new byte[cur.Length];
+                cur.CopyTo(prev);
+                return true;
+            }
+
+            // Frame generation. A 30 fps game arrives as A A B B C C. When B arrives we show mid(A,B), on B's repeat we show B,
+            // both `lag` after their arrival so the 60 steps stay even: the real frame waits about one tick plus lag, not a
+            // whole 30 fps frame. Content that changes every tick (a 60 fps game, menus) passes straight through.
+            bool fgOn = false, haveA = false, lastNew = false, pendingB = false;
+            double lag = 12; var costs = new List<double>();
+            int gen = 0, cuts = 0, late = 0;
+            void Wait(long until)
+            {
+                while (true)
+                {
+                    double left = (until - Stopwatch.GetTimestamp()) * 1000.0 / Stopwatch.Frequency;
+                    if (left <= 0) return;
+                    if (left > 1.5) Thread.Sleep(1); else Thread.SpinWait(50);
+                }
+            }
+            long At(long arrival) => arrival + (long)(lag * Stopwatch.Frequency / 1000);
+            void Show(IntPtr p, int pitch, long arrival)
             {
                 var cur = new ReadOnlySpan<byte>((void*)p, yuy2 ? pitch * fh : pitch * fh * 3 / 2);
-                if (cfg.SkipDupes)
+                bool wantFg = cfg.FrameGen && fw == 1920 && fh == 1080;
+                if (wantFg && fg == null && !fgFailed)
                 {
-                    if (prev != null && prev.Length == cur.Length)
-                    {
-                        bool same = true;
-                        for (int i = 0; i < cur.Length && same; i += Stride) same = Math.Abs(cur[i] - prev[i]) <= Tolerance;
-                        if (same) return;
-                    }
-                    else prev = new byte[cur.Length];
-                    cur.CopyTo(prev);
+                    SetStatus("Loading frame generation...");
+                    try { fg = new FrameGen(renderer.AdapterIndex()); fgNote = "RIFE 4.22 lite"; }
+                    catch (Exception ex) { fgFailed = true; fgNote = "frame generation failed: " + ex.Message.Split((char)10)[0]; }
+                    SetStatus("");
                 }
-                renderer.Draw(p, pitch, fw, fh, yuy2); shown++;
+                if (!wantFg || fg == null)
+                {
+                    fgOn = haveA = pendingB = false;
+                    if (!cfg.SkipDupes || IsNew(cur)) { renderer.Draw(p, pitch, fw, fh, yuy2); shown++; }
+                    return;
+                }
+                if (!fgOn) { fgOn = true; haveA = pendingB = false; }
+                bool isNew = IsNew(cur);
+                if (isNew)
+                {
+                    if (pendingB) { renderer.PresentRgb(false); shown++; pendingB = false; } // no repeat came: show B late rather than never
+                    renderer.NewFrame(p, pitch, fw, fh, yuy2, fg.Next());
+                    if (haveA && !lastNew)
+                    {
+                        if (fg.IsCut()) cuts++; // hold A one more tick instead of blending two shots
+                        else
+                        {
+                            fg.Run();
+                            renderer.Interpolate(fg.Flow, fg.Mask, cfg.SteadyHud);
+                            double cost = (Stopwatch.GetTimestamp() - arrival) * 1000.0 / Stopwatch.Frequency;
+                            costs.Add(cost);
+                            if (cost > lag + 1) late++;
+                            Wait(At(arrival));
+                            renderer.PresentRgb(true); gen++;
+                        }
+                        pendingB = true;
+                    }
+                    else { renderer.PresentRgb(false); shown++; }
+                    haveA = true;
+                }
+                else if (pendingB)
+                {
+                    Wait(At(arrival));
+                    renderer.PresentRgb(false); shown++; pendingB = false;
+                }
+                lastNew = isNew;
+            }
+            // lag follows the 90th percentile of the recent cost (+1 ms), between 4 and 15 ms, so mid frames are rarely late
+            void Retune()
+            {
+                if (costs.Count >= 10) { costs.Sort(); lag = Math.Clamp(costs[(int)(costs.Count * 0.9)] + 1, 4, 15); }
+                costs.Clear();
             }
             while (running && !restart)
             {
@@ -351,21 +427,24 @@ sealed class PreviewForm : Form
                 if (b2d != null)
                 {
                     b2d.Lock2D(out IntPtr p, out int pitch);
-                    try { Show(p, pitch); } finally { b2d.Unlock2D(); }
+                    try { Show(p, pitch, t0); } finally { b2d.Unlock2D(); }
                 }
                 else
                 {
                     buf.Lock(out IntPtr p, out _, out int len);
-                    try { Show(p, yuy2 ? len / fh : len * 2 / (3 * fh)); } finally { buf.Unlock(); }
+                    try { Show(p, yuy2 ? len / fh : len * 2 / (3 * fh), t0); } finally { buf.Unlock(); }
                 }
                 long now = Stopwatch.GetTimestamp();
                 worst = Math.Max(worst, now - last); last = now; frames++;
                 appWorst = Math.Max(appWorst, now - t0); appSum += now - t0;
                 if (sw.ElapsedMilliseconds >= 1000)
                 {
-                    statsText = $"{fw}x{fh}   {shown * 1000.0 / sw.ElapsedMilliseconds:F1} fps (capture {frames * 1000.0 / sw.ElapsedMilliseconds:F0})\nworst frame gap {worst * 1000.0 / Stopwatch.Frequency:F1} ms\napp {appSum * 1000.0 / Stopwatch.Frequency / Math.Max(1, frames):F1} ms (worst {appWorst * 1000.0 / Stopwatch.Frequency:F1})   driver age {(ages > 0 ? (ageSum / ages).ToString("F1") + " ms" : "n/a")}\nvsync {(renderer.Vsync ? "on" : "off")}   scaling {ScalerNames[cfg.Scaler]}\n{(audio is { } a ? $"audio {a.PeakDb:F0} dB" : audioNote)}";
+                    string fgLine = fgOn ? $"\nframe gen {fgNote}: +{gen * 1000.0 / sw.ElapsedMilliseconds:F0} fps   delay {lag:F1} ms   late {late}   cuts {cuts}   steady HUD {(cfg.SteadyHud ? "on" : "off")}"
+                        : cfg.FrameGen ? $"\nframe gen: {(fgFailed ? fgNote : fw == 1920 && fh == 1080 ? "starting" : "needs 1920x1080")}" : "";
+                    Retune();
+                    statsText = $"{fw}x{fh}   {(shown + gen) * 1000.0 / sw.ElapsedMilliseconds:F1} fps (capture {frames * 1000.0 / sw.ElapsedMilliseconds:F0})\nworst frame gap {worst * 1000.0 / Stopwatch.Frequency:F1} ms\napp {appSum * 1000.0 / Stopwatch.Frequency / Math.Max(1, frames):F1} ms (worst {appWorst * 1000.0 / Stopwatch.Frequency:F1})   driver age {(ages > 0 ? (ageSum / ages).ToString("F1") + " ms" : "n/a")}\nvsync {(renderer.Vsync ? "on" : "off")}   scaling {ScalerNames[cfg.Scaler]}\n{(audio is { } a ? $"audio {a.PeakDb:F0} dB" : audioNote)}{fgLine}";
                     if (cfg.Stats) BeginInvoke(UpdateHud);
-                    frames = 0; shown = 0; worst = 0; appWorst = 0; appSum = 0; ageSum = 0; ages = 0; sw.Restart();
+                    frames = 0; shown = 0; gen = 0; late = 0; cuts = 0; worst = 0; appWorst = 0; appSum = 0; ageSum = 0; ages = 0; sw.Restart();
                 }
             }
         }

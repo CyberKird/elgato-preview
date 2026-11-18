@@ -12,6 +12,8 @@ sealed class Settings
     public string AudioIn { get; set; } = "HD60 S Audio"; // part of the endpoint name
     public string AudioOut { get; set; } = ""; // "" = Windows default output
     public bool SkipDupes { get; set; } = true;
+    public bool FrameGen { get; set; } // RIFE in-between frames for 30 fps games (G)
+    public bool SteadyHud { get; set; } // keep pixels that did not change between real frames (H); off: RIFE alone scored better in tests
     public bool Exclusive { get; set; } // exclusive fullscreen, needed for AMD AFMF on RX 6000
     public bool Stats { get; set; }
     public bool TopMost { get; set; }
